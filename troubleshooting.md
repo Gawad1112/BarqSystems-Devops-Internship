@@ -74,5 +74,5 @@ Do not fabricate a failed attempt just to fill the template. Record actual attem
 - Root cause: The published container port in docker-compose.yml (`81`) did not match the port nginx listens on (`80`).
 - Fix: Changed `ports: ["127.0.0.1:${PUBLIC_PORT:-8080}:81"]` to `ports: ["127.0.0.1:${PUBLIC_PORT:-8080}:80"]`. I chose to change Compose rather than change nginx.conf to `listen 81`, because 80 is the standard HTTP port and the nginx image default, while 81 was arbitrary.
 - Retest evidence: `docker compose -p barq-assessment up -d` recreated nginx, then `curl -i http://127.0.0.1:8080/` returned `HTTP/1.1 502 Bad Gateway` with `Server: nginx/1.28.3`. A 502 is a real HTTP response from nginx, which proves the request now reaches it. The remaining failure is one layer deeper.
-- Related commit: <fill in after committing>
+- Related commit: - 66ea426
 - Remaining uncertainty: None on the port mismatch itself. The 502 confirms my earlier prediction that nginx cannot reach the backends, but I have not yet proven why — I need to read the nginx error log to see the exact connection failure.
