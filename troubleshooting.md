@@ -76,3 +76,15 @@ Do not fabricate a failed attempt just to fill the template. Record actual attem
 - Retest evidence: `docker compose -p barq-assessment up -d` recreated nginx, then `curl -i http://127.0.0.1:8080/` returned `HTTP/1.1 502 Bad Gateway` with `Server: nginx/1.28.3`. A 502 is a real HTTP response from nginx, which proves the request now reaches it. The remaining failure is one layer deeper.
 - Related commit: - 66ea426
 - Remaining uncertainty: None on the port mismatch itself. The 502 confirms my earlier prediction that nginx cannot reach the backends, but I have not yet proven why — I need to read the nginx error log to see the exact connection failure.
+
+## Entry 6 / 2026-09-07 / 06:30 PM
+- Symptom: No runtime symptom yet. Found by reading docker-compose.yml. The postgres service mounts the named volume `postgres-data` at `/var/lib/postgresql/backup`, and separately declares `tmpfs: [/var/lib/postgresql/data]`. tmpfs is memory-backed storage that is discarded when the container stops.
+- Hypothesis: If PostgreSQL's real data directory is `/var/lib/postgresql/data`, then the durable volume is attached to a directory Postgres never writes to, while the directory it does write to lives in RAM. Any record created would be lost when the container stops.
+- Command or test: I did not want to assume the data path, so I asked the image itself rather than trusting documentation or memory: `docker run --rm postgres:16-alpine printenv PGDATA`
+- Actual output: `/var/lib/postgresql/data`. The image pulled for this check reported digest `sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685`, which matches the digest pinned for postgres in docker-compose.yml, so this is the exact image the project uses and the result applies directly.
+- Failed attempt and what changed your thinking: No failed attempt here, but I nearly accepted the data path as given. Verifying it against the image was worth doing, because the whole conclusion depends on that one path being correct. If PGDATA had turned out to be `/var/lib/postgresql/backup`, the configuration would have been fine and my reading would have been wrong.
+- Root cause: The durable named volume is mounted at a path PostgreSQL does not use, and PostgreSQL's actual data directory is mounted as tmpfs, so all database state is held in memory only.
+- Fix: not yet applied.
+- Retest evidence: pending. The test will be to create a record through `POST /records`, recreate the app and postgres containers while keeping the volume, and confirm the record is still returned by `GET /records`. Under the current configuration I expect it to be gone.
+- Related commit: pending.
+- Remaining uncertainty: I have confirmed the misconfiguration but have not yet observed data loss directly, because the app is not reachable through nginx yet. I will confirm the symptom once the 502 is resolved.
