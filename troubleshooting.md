@@ -121,5 +121,5 @@ for i in $(seq 1 30); do curl -s http://127.0.0.1:8080/instance | grep -o 'app-0
   `jq -R -r 'fromjson? | select(.timestamp) | .timestamp' logs/access.log | sort | tail -1`
   `-R` reads each line as a raw string rather than parsing it as JSON; `fromjson` then parses that string; the `?` operator discards lines that fail to parse and continues.
 - Retest evidence: Corrected command returned `2026-08-20T11:29:57.578Z` for access.log and `2026-08-20T11:29:57.578Z` for application.log, both matching the last line of each file as shown by `tail -3`. No parse errors were printed. Valid-line counts: `jq -R -r 'fromjson? | "ok"' logs/access.log | wc -l` returned 725 of 726 total lines, and 729 of 730 for application.log — confirming exactly one malformed line per file, not a larger set that the aborted run had hidden.
-- Related commit: (fill in after you commit)
+- Related commit: b7e754c
 - Remaining uncertainty: jq reported the failure at line 313, but line 313 itself parses as valid JSON when tested alone (`cat -A` shows a single clean line ending, 211 bytes, one complete object). The reported position is where the parser gave up, not necessarily where the defect is. I have not yet identified which line is genuinely malformed.
