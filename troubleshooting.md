@@ -60,10 +60,10 @@ Do not fabricate a failed attempt just to fill the template. Record actual attem
 - Actual output: The app started normally with `* Running on http://127.0.0.1:8080`. The log then repeats, every five seconds: `"method": "GET", "path": "/healthz", "status": 404`. The app is answering the health check and returning 404, not refusing the connection.
 - Failed attempt and what changed your thinking: My hypothesis was wrong. This is not a connection problem, it is a wrong URL. The health check runs inside the same container as the app, so `127.0.0.1` works fine for it. `APP_HOST` only blocks access from other containers such as nginx. Loopback is not universally broken — it depends who is asking. My 502 prediction was also untested at this point, because nginx had not started at all, so one fault was hiding another.
 - Root cause: The healthcheck in docker-compose.yml requests `/healthz`, but `assessment/APPLICATION.md` defines the liveness endpoint as `/health`. The extra character means the app correctly returns 404 for an unknown route, and Docker reads the non-200 response as unhealthy.
-- Fix: not yet applied.
-- Retest evidence: pending.
-- Related commit: pending.
-- Remaining uncertainty: I have not yet decided whether to change the healthcheck URL to `/health` or check whether the app was also intended to expose `/healthz`. I need to read `app/server.py` to see which routes actually exist before choosing.
+- Fix: Changed the healthcheck in docker-compose.yml from `/healthz` to `/health`, the endpoint the application actually implements per assessment/APPLICATION.md.
+- Retest evidence: `docker compose -p barq-assessment ps` showed app-01 and app-02 as `Up (healthy)` after recreation, where both had previously reported `Up (unhealthy)`. The repeating `"path": "/healthz", "status": 404` entries stopped appearing in the app logs.
+- Related commit: a1c3e67
+- Remaining uncertainty: Resolved. I read app/server.py and confirmed only `/health` exists; there is no `/healthz` route, so changing the check rather than adding a route was the correct direction.
 
 ## Entry 5 / 2026-09-08 / 01:00 AM
 - Symptom: With all five containers running, `curl -i http://127.0.0.1:8080/` returned `curl: (56) Recv failure: Connection reset by peer`. No HTTP status line, no headers, no body.
@@ -84,9 +84,9 @@ Do not fabricate a failed attempt just to fill the template. Record actual attem
 - Actual output: `/var/lib/postgresql/data`. The image pulled for this check reported digest `sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685`, which matches the digest pinned for postgres in docker-compose.yml, so this is the exact image the project uses and the result applies directly.
 - Failed attempt and what changed your thinking: No failed attempt here, but I nearly accepted the data path as given. Verifying it against the image was worth doing, because the whole conclusion depends on that one path being correct. If PGDATA had turned out to be `/var/lib/postgresql/backup`, the configuration would have been fine and my reading would have been wrong.
 - Root cause: The durable named volume is mounted at a path PostgreSQL does not use, and PostgreSQL's actual data directory is mounted as tmpfs, so all database state is held in memory only.
-- Fix: not yet applied.
-- Retest evidence: pending. The test will be to create a record through `POST /records`, recreate the app and postgres containers while keeping the volume, and confirm the record is still returned by `GET /records`. Under the current configuration I expect it to be gone.
-- Related commit: pending.
+- Fix: Mounted the named volume `postgres-data` at `/var/lib/postgresql/data` (the real PGDATA) and removed the `tmpfs` declaration, so the data directory is durable rather than memory-backed.
+- Retest evidence: Configuration change verified in the diff (1431fca), but the behavioural test — creating a record, recreating containers with the volume retained, and confirming the record survives — has not yet been run. Scheduled as part of the Part 3 persistence test.
+- Related commit: 1431fca
 - Remaining uncertainty: I have confirmed the misconfiguration but have not yet observed data loss directly, because the app is not reachable through nginx yet. I will confirm the symptom once the 502 is resolved.
 
 ## Entry 7 / 2026-09-08 / 02:00 AM
