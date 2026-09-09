@@ -2,7 +2,12 @@ name: barq-assessment
 x-app: &app
   build: .
   init: true
-  restart: "no"
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: "0.50"
+        memory: 256M
   env_file: ./config/app.env
   environment: &app-env
     APP_HOST: "0.0.0.0"
