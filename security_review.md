@@ -14,14 +14,14 @@ Cover secrets, ports, container user, image selection, networks, persistence/bac
 logging/monitoring and availability. Separate completed work from planned improvements.
 
 ## Finding 1 — Database password stored in plaintext inside the repository
-- Risk and evidence: `config/app.env` contains `DATABASE_URL=postgresql://barq_app:BarqLabOnly_7qN2vK8d@postgres:5433/barq_tasks`. The credential is in a file inside the project directory, loaded into both app containers via `env_file`.
+- Risk and evidence: `config/app.env` contains `DATABASE_URL=postgresql://barq_app:<redacted>@postgres:5433/barq_tasks`. The credential is in a file inside the project directory, loaded into both app containers via `env_file`.
 - Impact: If this file is tracked by git, the password is in the repository history and remains recoverable even after deletion. Anyone with read access to the repo, now or later, has the database credential.
 - Implemented fix / commit: Not yet fixed. Verification of whether it is tracked is pending (`git ls-files config/app.env`).
 - Production follow-up: Credentials should come from a secret manager or from environment variables injected at deploy time, never from a file in the repo. The repo should contain only `.env.example` with placeholder values. If a real credential has ever been committed, it must be rotated, not just removed, because removal does not erase history.
 - How to verify: `git ls-files config/app.env` to confirm tracking status, and `git log --all --full-history -- config/app.env` to check whether it appears in history.
 
 ## Finding 2 — Application password is written into the application's own logs
-- Risk and evidence: On startup, app-01 logs `"database_url": "postgresql://barq_app:BarqLabOnly_7qN2vK8d@postgres:5433/barq_tasks"` as part of its `configuration_loaded` event, visible in `docker compose logs app-01`.
+- Risk and evidence: On startup, app-01 logs `"database_url": "postgresql://barq_app:<redacted>@postgres:5433/barq_tasks"` as part of its `configuration_loaded` event, visible in `docker compose logs app-01`.
 - Impact: Credentials leak into any system that collects container logs. Log aggregators are typically read by more people than have database access, and log retention often outlives credential rotation.
 - Implemented fix / commit: Not yet fixed.
 - Production follow-up: Redact credentials before logging connection strings. Log the host, port and database name, never the password. This is a code change in the application's startup logging.
