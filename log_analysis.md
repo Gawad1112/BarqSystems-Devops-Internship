@@ -842,6 +842,272 @@ errors; the remaining 18 minutes were clean.
 
 ---
 
+### Q8. One correlated failed request and one successful request
+
+Both are `GET /records` served by **app-02**, 1 minute 57 seconds apart. Same endpoint,
+same backend, same client. The only difference is that one falls inside incident 4.
+
+---
+
+**Failed request — `lab-000606`, 11:25:14**
+
+*access.log (NGINX):*
+```json
+{"timestamp":"2026-08-20T11:25:14.501Z","request_id":"lab-000606","method":"GET",
+ "path":"/records","status":504,"upstream":"172.23.0.12:8080","upstream_status":"504",
+ "request_time":2.001,"client":"192.0.2.24"}
+```
+
+*application.log (app-02):*
+```json
+{"timestamp": "2026-08-20T11:25:15.200Z", "level": "INFO", "event": "http_request",
+ "request_id": "lab-000606", "instance_id": "app-02", "method": "GET",
+ "path": "/records", "status": 200, "duration_ms": 2700}
+```
+
+*error.log (NGINX):*
+2026/08/20 11:25:14 [error] 31#31: upstream timed out (110: Operation timed out)
+while reading response header from upstream, request_id=lab-000606,
+request: "GET /records HTTP/1.1", upstream: "http://172.23.0.12:8080/records"
+
+
+**The two logs disagree about the outcome of the same request.**
+
+| | NGINX | app-02 |
+|---|---|---|
+| status | **504** | **200** |
+| duration | 2.001 s | 2700 ms |
+| level | error | INFO |
+
+NGINX opened the connection successfully, sent the request, waited **2.001 seconds** for
+a response header, gave up, and returned 504 to the client. app-02 completed the same
+request **successfully** at **2.7 seconds** and logged it at INFO with no error of any
+kind — 699 ms after NGINX had already abandoned it.
+
+The client received a failure for a request the application considered a success. The
+application has no record that anything went wrong, so an alert built only on
+application logs would never have fired.
+
+All 8 requests in incident 4 follow this identical pattern — `request_time: 2.001`
+against `duration_ms: 2700`, every time — which rules out coincidence. The consistency
+of 2.001 s indicates a proxy read timeout configured at approximately 2 seconds, below
+the time `/records` legitimately needed under load.
+
+---
+
+**Successful request — `lab-000654`, 11:27:12**
+
+*access.log (NGINX):*
+```json
+{"timestamp":"2026-08-20T11:27:12.576Z","request_id":"lab-000654","method":"GET",
+ "path":"/records","status":200,"upstream":"172.23.0.12:8080","upstream_status":"200",
+ "request_time":0.076,"client":"192.0.2.24"}
+```
+
+*application.log (app-02):*
+```json
+{"timestamp": "2026-08-20T11:27:12.576Z", "level": "INFO", "event": "http_request",
+ "request_id": "lab-000654", "instance_id": "app-02", "method": "GET",
+ "path": "/records", "status": 200, "duration_ms": 76.0}
+```
+
+*error.log:* no entry — nothing failed.
+
+Here the two logs agree exactly: identical timestamps, both status 200, `request_time`
+0.076 s and `duration_ms` 76.0 ms — the same number in different units. That agreement
+is what a healthy request looks like, and it is what makes the 699 ms gap in
+`lab-000606` diagnostic rather than measurement noise.
+
+---
+
+**Correlation method.** `request_id` is the join key, present in all three logs. It is
+the only field that reliably identifies one client request across them — timestamps
+differ between the NGINX and application records for the same request (by 699 ms in the
+failed case), and matching on time alone would have paired the wrong records.
+
+---
+
+### Q9. Proxy/connectivity versus dependency/application issues
+
+The four incidents split cleanly into two classes, and **which log recorded them is
+itself the proof.**
+
+---
+
+**Proxy / connectivity — incidents 1 and 4 (48 requests)**
+
+| | incident 1 | incident 4 |
+|---|---|---|
+| window | 11:05:02–11:09:57 | 11:25:14–11:26:47 |
+| error.log | 59 × `connect() failed (111)` | 8 × `upstream timed out (110)` |
+| client status | 502 (40) | 504 (8) |
+| application.log | **no records at all** | records show **status 200** |
+
+*What proves it:*
+
+1. **Both appear in error.log**, which is written by NGINX about its own attempts to
+   reach a backend. Neither `connect() failed` nor `upstream timed out` is an
+   application-generated message.
+2. **Neither produced a single `dependency_error` record.** All 47 dependency errors
+   fall in incidents 2 and 3.
+3. **Incident 1's application-side evidence is an absence.** The 40 failed request_ids
+   appear in access.log and in error.log but in neither application instance's log. A
+   connection that was refused at the TCP layer never delivered bytes to any
+   application, so there was nothing for it to record. Three independent counts agree
+   at exactly 40.
+4. **Incident 4's application-side evidence is a contradiction.** The applications
+   logged `status: 200` for all 8 requests. The failure was entirely NGINX's timeout
+   decision, not an application fault.
+
+*Distinguishing the two within this class:* `connection refused` (errno 111) is an
+immediate rejection — nothing was listening — and returns in **0.003 s**.
+`operation timed out` (errno 110) means the connection succeeded and the response never
+arrived in time, returning after **2.001 s**. One is a dead process; the other is a
+slow one.
+
+*Scope:* incident 1 affected **one backend only** (all 59 errors name `172.23.0.12`).
+Incident 4 affected **both** (4 errors each on `.11` and `.12`) but **only `/records`` —
+both backends failing simultaneously on a single endpoint points at something they
+share, not at the backends themselves.
+
+---
+
+**Dependency / application — incidents 2 and 3 (47 requests)**
+
+| | incident 2 | incident 3 |
+|---|---|---|
+| window | 11:12:09–11:15:52 | 11:20:07–11:21:45 |
+| application.log | 31 × `redis` / `TimeoutError` | 16 × `postgres` / `InvalidPassword` |
+| client status | 503 | 503 |
+| client latency | 2.025 s | 0.041 s |
+| error.log | **silent** | **silent** |
+
+*What proves it:*
+
+1. **Both appear only in application.log**, as explicit `dependency_error` records
+   naming the failing dependency and its error type. The application knew exactly what
+   had failed and said so.
+2. **error.log contains nothing for either window.** NGINX connected to a backend and
+   received a complete, valid HTTP response — a 503. From the proxy's perspective the
+   request was successfully proxied. These incidents are invisible in the proxy logs.
+3. **The affected endpoints match the dependency graph.** Redis broke `/counter` and
+   `/ready`; PostgreSQL broke `/records` and `/ready`. `/ready` fails under both because
+   it checks both. `/health`, which checks neither, never failed in these windows.
+4. **Both instances failed simultaneously**, which is expected when the fault is in a
+   shared dependency rather than in either application.
+
+*Distinguishing the two within this class — latency, not status code.* Both returned
+503. Only the timing separates them: `TimeoutError` took **2.025 s** because the
+application waited out its full timeout budget for a reply that never came;
+`InvalidPassword` took **0.041 s** because PostgreSQL reached and actively rejected the
+credentials immediately. Same client-visible symptom, opposite mechanisms, entirely
+different fixes.
+
+---
+
+**Why the classification matters.** Each class calls for a different response:
+
+- **Proxy/connectivity faults are instance-local or configuration-level.** Retrying on
+  another backend fixes incident 1 — proven, since 19 requests were retried and all 19
+  succeeded on the healthy instance. Incident 4 is a timeout tuning problem: the
+  applications were working.
+- **Dependency faults are shared.** Retrying incidents 2 or 3 on the other instance
+  would reach the same Redis and the same PostgreSQL and fail identically. Retry would
+  double the load on an already-struggling dependency without improving any outcome.
+
+A retry policy that does not distinguish these makes incident 1 better and incidents 2
+and 3 worse.
+
+---
+
+### Q10. What the logs do not prove, and what to check next
+
+**What cannot be determined from these three files**
+
+**1. Why app-02 stopped accepting connections.** The logs prove *that* it refused
+connections between 11:05:02 and 11:09:57 and recovered by 11:10:02. They do not show
+why. A stopped container, a crashed application process, an OOM kill, a failed port
+binding on restart, or a deliberate restart would all produce byte-identical evidence:
+`connection refused` from NGINX and silence from the application. The recovery is
+equally unexplained — an automatic restart policy, an orchestrator rescheduling, and a
+human intervention are indistinguishable here.
+
+*Next check:* `docker inspect` for exit codes and restart counts, container-level events
+(`docker events`), and orchestrator logs. `State.OOMKilled` and `RestartCount` would
+separate a resource exhaustion from a crash loop from a manual action.
+
+**2. Why Redis timed out and why PostgreSQL rejected credentials.** These records are
+the *application's view* of a failure. `TimeoutError` says the application gave up
+waiting; it does not say whether Redis was slow, saturated, evicting under memory
+pressure, or unreachable. `InvalidPassword` says PostgreSQL refused the credentials
+offered; it does not say whether a password was rotated, whether the application loaded
+stale configuration, or whether the wrong user was configured.
+
+*Next check:* Redis `INFO` (memory, evicted_keys, blocked_clients, latency history) and
+PostgreSQL's own server log, which records authentication failures with the username
+and source address. The PostgreSQL log would immediately distinguish "wrong password
+for the right user" from "user does not exist".
+
+**3. The NGINX configuration in force at the time.** The per-endpoint retry split is
+inferred entirely from behaviour — `/ready` and `/instance` were retried, `/`,
+`/counter`, `/health` and `/records` were not. This is *consistent with* different
+`proxy_next_upstream` settings per location block, but the configuration file was never
+supplied and cannot be reconstructed from logs. Likewise, the 2.001 s ceiling in
+incident 4 strongly suggests `proxy_read_timeout 2s`, but the actual directive is not
+visible.
+
+*Next check:* `nginx -T`, which dumps the complete running configuration including all
+included files — the same command used in troubleshooting.md Entry 7 to disprove a
+stale-config hypothesis.
+
+**4. Whether the collector rotation caused the duplicate records.** The 5 byte-identical
+records in access.log fall on exact 5-minute boundaries, and error.log's closing line
+reads `log collector rotated stream`. The correlation is strong but the notice appears
+**once**, at 11:30, not five times. The causal link is plausible, not proven.
+
+*Next check:* the log collector's own configuration and logs — rotation interval,
+at-least-once delivery semantics, and whether it acknowledges writes.
+
+**5. Whether these four incidents share a root cause.** They are treated above as
+independent because they affect different components and are separated by clean quiet
+periods. But a single underlying event — a host resource constraint, a network
+partition, a deployment — could plausibly produce a backend outage, then dependency
+timeouts, then credential failures, then slow responses in sequence. The logs show
+correlation in time and nothing about causation.
+
+*Next check:* host metrics (CPU, memory, disk I/O, network) across the full window, and
+any deployment or configuration-change audit trail for 11:00–11:30.
+
+**6. What happened to the client.** All 720 requests come from a single client address,
+`192.0.2.24`, at a near-constant rate. The logs do not show whether a real user was
+affected, whether the client retried at its own layer, or whether this is synthetic load.
+
+**7. The 40 requests' true impact.** Those requests returned 502 and are recorded as
+failures. Whether the calling system retried them, degraded gracefully, or surfaced an
+error to a person is outside these files entirely.
+
+---
+
+**What the logs do prove, for contrast**
+
+- Exact incident windows to the second, and that they are discrete rather than
+  continuous.
+- That one backend, not both, failed in incident 1 — and that it fully recovered.
+- That retry works and succeeded 19 times out of 19 when it was applied.
+- That the applications succeeded on requests NGINX reported as failures.
+- Which dependency broke which endpoint, corroborating the documented API contract.
+
+---
+
+**Structural limitation.** These are three files covering 30 minutes with no
+before-and-after context, no configuration, no host metrics and no orchestration events.
+Every conclusion above is bounded by what a proxy and an application chose to write
+down. The clearest demonstration of that limit is incident 4: had only application logs
+been available, the incident would have been invisible — 8 requests, all logged
+`status: 200`, all considered successful.
+
+---
+
 ## Timeline and correlated examples
 
 ## Evidence that the originals were unmodified
