@@ -487,6 +487,121 @@ jq -R -r 'fromjson? | select(.path) | .path' logs/access.log | sort | uniq -c
 
 ---
 
+### Q5. Median and p95 client latencies
+
+**Median: 0.054 s (54 ms). p95: 2.001 s.**
+
+**Field and units.** Taken from `request_time` in access.log, which NGINX records in
+**seconds**. This is the closest available measure of what the client experienced: the
+time from NGINX receiving the request to finishing the response.
+
+application.log also carries latency, as `duration_ms` in **milliseconds**, but it
+measures a different span — time spent inside the application, excluding NGINX's own
+handling and connection setup. The two are not interchangeable, and incident 4 proves
+it: `lab-000606` recorded `request_time: 2.001` in access.log and `duration_ms: 2700`
+in application.log for the same request, a 700 ms disagreement. Mixing the two fields
+would produce a meaningless distribution.
+
+**Population: 720 distinct client requests** — the same denominator as Q3, deduplicated
+on request_id so the 5 collector replays are not counted twice.
+
+```bash
+jq -R -r 'fromjson? | select(.request_id and .request_time) | .request_id + " " + (.request_time|tostring)' logs/access.log \
+  | sort -u | awk '{print $2}' | sort -n > analysis/latencies.txt
+wc -l < analysis/latencies.txt      # 720
+```
+
+**Percentile methods, stated explicitly.**
+
+Median — the middle value of the sorted list. With an even count (720) there is no
+single middle, so the two central values (ranks 360 and 361) are averaged. This is
+linear interpolation between the two central observations.
+
+```bash
+awk '{a[NR]=$1} END {
+  if (NR % 2) print a[(NR+1)/2];
+  else print (a[NR/2] + a[NR/2+1]) / 2
+}' analysis/latencies.txt
+# -> 0.054
+```
+
+p95 — **nearest-rank method**: the smallest value in the sorted list such that at least
+95% of observations are less than or equal to it. Rank = ceiling(0.95 × N) =
+ceiling(684) = 684.
+
+```bash
+awk '{a[NR]=$1} END {
+  r = 0.95 * NR;
+  k = (r == int(r)) ? r : int(r) + 1;
+  print "rank " k " of " NR ": " a[k]
+}' analysis/latencies.txt
+# -> rank 684 of 720: 2.001
+```
+
+Nearest-rank was chosen because it always returns an actual observed value rather than
+an interpolated one that no request experienced. Other methods (linear interpolation
+between ranks, as used by numpy's default percentile) would return a value between
+0.12 and 2.001 here, which would be misleading — no request took 1.2 seconds.
+
+**Why p95 lands in the failure population.** 105 of 720 requests (14.58%) were
+non-successful, and nearly all of those were slow. Since 14.58% exceeds 5%, the 95th
+percentile falls *inside* the failing group rather than at the top of the healthy one.
+Rank 684 leaves 36 observations at or above it, and there are 39 values at 2.001 s or
+higher (8 × 2.001 and 31 × 2.025), so rank 684 sits within the 2.001 block.
+
+The practical reading: p95 here is not "the slow tail of normal traffic" — it is the
+incident. A p95 of 2.001 s against a median of 0.054 s is a 37× gap, and that gap is
+entirely explained by the four incidents in Q4.
+
+**Range:** minimum 0.003 s, maximum 2.025 s.
+
+**Distribution — the repeated values are the incidents, not noise:**
+
+```bash
+sort -n analysis/latencies.txt | uniq -c | sort -rn | head -10
+```
+
+| count | latency | what it is |
+|---|---|---|
+| 40 | 0.003 s | connection refused — instant TCP rejection, 502 |
+| 31 | 2.025 s | Redis TimeoutError — full timeout budget burned, 503 |
+| 24 | 0.041 s | 16 PostgreSQL InvalidPassword (503) + 8 unrelated successes |
+| 19 | 0.120 s | retried requests — failed attempt plus successful one |
+| ~9 each | 0.015–0.094 s | ordinary successful traffic |
+
+**Three distinct failure speeds, each diagnostic of its mechanism:**
+
+- **0.003 s** — nothing was listening. NGINX got an immediate TCP rejection and returned
+  502 in 3 ms. A failure faster than any success.
+- **0.041 s** — the dependency was reached and actively refused the credentials.
+  PostgreSQL rejected the password immediately; there was nothing to wait for.
+- **2.025 s** — the dependency was reached but never answered. The application waited
+  out its full timeout before returning 503.
+
+The 16 fast failures were confirmed as the PostgreSQL incident by time and path:
+
+```bash
+jq -R -r 'fromjson? | select(.request_id and .request_time == 0.041) | .request_id' logs/access.log | sort -u > analysis/lat041_ids.txt
+grep -Ff analysis/lat041_ids.txt logs/access.log | jq -R -r 'fromjson? | .status' | sort | uniq -c
+#   8 200    16 503
+```
+
+All 16 of the 503s fall between 11:20:07 and 11:21:45 on `/ready` and `/records`,
+matching the 16 `postgres InvalidPassword` events exactly. The 8 successes are ordinary
+requests spread across the full 30 minutes that happen to land on 0.041 s in the normal
+latency cycle, and are unrelated.
+
+This matters because **status code alone would have hidden the distinction.** All 47
+dependency failures returned 503. Only the latency separates a timeout from a
+rejection, and they are different faults requiring different fixes.
+
+**Limitation.** The successful-request latencies are visibly synthetic: they step
+through a fixed repeating cycle (0.015, 0.020, 0.023, 0.025, 0.028 …) rather than
+forming a natural distribution, and `logs/README.md` states the data is synthetic lab
+data. The percentile arithmetic is correct, but the median should not be read as a
+measured service characteristic of a real system.
+
+---
 
 ### Q6. Which requests retried upstream, and how many succeeded
 
