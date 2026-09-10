@@ -669,6 +669,179 @@ location block, but the configuration itself is not visible in the logs. See Q10
 
 ---
 
+### Q7. Incident timeline
+
+Four discrete incidents in a 30-minute window, each with a clean start and end,
+separated by periods with no errors at all. Every phase below cites evidence from more
+than one log.
+
+**Total client-visible failure: 11:05:02 to 11:26:47.**
+
+```bash
+jq -R -r 'fromjson? | select(.request_id and .status) | .request_id + " " + .timestamp[11:19] + " " + (.status|tostring)' logs/access.log \
+  | sort -u | awk '$3 ~ /^5/ {print $2, $3}' | sort | head -1   # 11:05:02 502
+  # ... | tail -1                                               # 11:26:47 504
+```
+
+---
+
+**11:00:00 – 11:05:01 — normal operation**
+
+- *access.log:* traffic begins at 11:00:00.015Z, roughly one request every 2.5 seconds,
+  alternating between both backends. All responses 200 except the `/missing` probe.
+- *application.log:* both app-01 and app-02 serving. app-02's last pre-incident request
+  is at **11:04:57**.
+- *error.log:* empty — the file does not begin until 11:05:02.
+
+The only anomaly is `GET /missing`, returning 404 every ~3m17s throughout. It predates
+the incidents and continues after them, and is unrelated (see Q3).
+
+---
+
+**11:05:02 – 11:09:57 — Incident 1: app-02 refusing connections**
+
+- *error.log:* 59 × `connect() failed (111: Connection refused) while connecting to
+  upstream`. **Every one names `172.23.0.12:8080` and none names `.11`** — a single
+  failing backend, not both. 12 errors per minute.
+- *access.log:* 40 client requests returned **502** in 0.003 s each — an immediate TCP
+  rejection, faster than any successful request. A further 19 requests show
+  comma-separated upstream values `502, 200`: NGINX retried them on the surviving
+  backend and all 19 returned 200 to the client.
+- *application.log:* **no records exist for the 40 failed requests.** This is not
+  missing data — the connection was never established, so no application received bytes
+  to log. All 19 retried requests are recorded, every one served by **app-01**.
+
+app-02's absence is bounded precisely: last request at **11:04:57**, first request
+after recovery at **11:10:02**.
+
+```bash
+jq -R -r 'fromjson? | select(.instance_id=="app-02" and .event=="http_request") | .timestamp[11:19]' logs/application.log \
+  | sort | awk '$1 < "11:05:02"' | tail -1     # 11:04:57
+jq -R -r 'fromjson? | select(.instance_id=="app-02" and .event=="http_request") | .timestamp[11:19]' logs/application.log \
+  | sort | awk '$1 > "11:09:57"' | head -3     # 11:10:02, 11:10:07, 11:10:12
+```
+
+With traffic alternating between two backends every 2.5 seconds, a 5-second gap on
+either side is exactly one round-robin cycle. app-02 stopped and resumed serving at the
+precise boundaries of the error window — **a clean outage with full recovery**, not a
+backend that stayed down.
+
+Within this window, outcome depended entirely on which endpoint was requested:
+`/ready` and `/instance` were retried and succeeded; `/`, `/counter`, `/health` and
+`/records` were not retried and returned 502. Both behaviours ran in parallel — 8
+non-retried and 4 retried every minute — which rules out a configuration change
+partway through. See Q6.
+
+---
+
+**11:10:02 – 11:12:08 — recovery, no errors**
+
+- *application.log:* app-02 serving again from 11:10:02.
+- *access.log:* all 200.
+- *error.log:* silent.
+
+---
+
+**11:12:09 – 11:15:52 — Incident 2: Redis timeouts**
+
+- *application.log:* 31 × `dependency_error` naming `redis` / `TimeoutError`. Affects
+  `/counter` (16) and `/ready` (15). **Both instances affected**, which is expected —
+  they share one Redis.
+- *access.log:* the same 31 requests return **503**, each taking **2.025 s**. The
+  application waited out its full timeout before giving up.
+- *error.log:* **silent throughout.** NGINX reached a backend and received a valid HTTP
+  response, so from its perspective nothing failed. This incident is invisible in the
+  proxy logs.
+
+```bash
+jq -R -r 'fromjson? | select(.event=="dependency_error" and .dependency=="redis") | .timestamp[11:19]' logs/application.log | sort | head -1   # 11:12:09
+  # ... | tail -1                                                                                                                             # 11:15:52
+```
+
+---
+
+**11:15:53 – 11:20:06 — quiet, no errors**
+
+---
+
+**11:20:07 – 11:21:45 — Incident 3: PostgreSQL credential rejection**
+
+- *application.log:* 16 × `dependency_error` naming `postgres` / `InvalidPassword`.
+  Affects `/records` (8) and `/ready` (8). Both instances again.
+- *access.log:* the same 16 requests return **503** — but in **0.041 s**, not 2.025 s.
+  PostgreSQL actively rejected the credentials immediately; there was nothing to wait
+  for. Same status code as incident 2, arrived at by an entirely different mechanism,
+  and only the latency distinguishes them.
+- *error.log:* silent again, for the same reason as incident 2.
+
+```bash
+jq -R -r 'fromjson? | select(.event=="dependency_error" and .dependency=="postgres") | .timestamp[11:19]' logs/application.log | sort | head -1   # 11:20:07
+  # ... | tail -1                                                                                                                                # 11:21:45
+```
+
+`/ready` fails in both incidents 2 and 3 because it checks both dependencies; `/counter`
+fails only under Redis and `/records` only under PostgreSQL. This matches the
+documented API contract exactly.
+
+---
+
+**11:21:46 – 11:25:13 — quiet, no errors**
+
+---
+
+**11:25:14 – 11:26:47 — Incident 4: proxy read timeout on /records**
+
+- *error.log:* 8 × `upstream timed out (110: Operation timed out) while reading response
+  header`. **Both backends this time** — 4 on `.11` and 4 on `.12` — and **only
+  `/records`**. Both backends failing simultaneously on one endpoint points at
+  something shared, not at the backends.
+- *access.log:* 8 requests return **504** after exactly **2.001 s**.
+- *application.log:* 8 records exist for these requests, and **all report
+  `status: 200` with `duration_ms: 2700`.**
+
+This is the sharpest finding in the dataset. The applications completed these requests
+**successfully** at 2.7 seconds; NGINX had already abandoned them at 2.0 seconds and
+returned an error to the client. **The client received a failure for a request the
+application considered a success.** Neither log alone tells the truth about what
+happened. See Q8.
+
+Note this incident produced no `dependency_error` records at all — the dependency
+errors stop at 11:21:45 and this begins at 11:25:14. Nothing failed inside the
+application, so the application logged no failure.
+
+---
+
+**11:26:48 – 11:29:57 — recovery, no further errors**
+
+- *access.log:* final request at 11:29:57.578Z, status 200.
+- *error.log:* final line at **11:30:00** — `log collector rotated stream`, a notice,
+  not an error.
+
+---
+
+**Summary**
+
+| window | duration | incident | status | client latency | which logs show it |
+|---|---|---|---|---|---|
+| 11:05:02–11:09:57 | 4m55s | app-02 refusing connections | 502 (40) | 0.003 s | access + error; **absent** from app log |
+| 11:12:09–11:15:52 | 3m43s | Redis TimeoutError | 503 (31) | 2.025 s | access + app; **silent** in error log |
+| 11:20:07–11:21:45 | 1m38s | PostgreSQL InvalidPassword | 503 (16) | 0.041 s | access + app; **silent** in error log |
+| 11:25:14–11:26:47 | 1m33s | upstream read timeout | 504 (8) | 2.001 s | access + error; app log shows **200** |
+
+95 failed requests of 720 (13.19%). Roughly 12 minutes of the 30-minute window contained
+errors; the remaining 18 minutes were clean.
+
+**Three things this timeline shows that no single log would have:**
+
+1. Incident 1 is **only** visible as an absence in application.log — the missing records
+   are the evidence.
+2. Incidents 2 and 3 are **invisible** in error.log, because NGINX considered every one
+   of those requests successfully proxied.
+3. Incident 4 is recorded as a **failure** by NGINX and a **success** by the
+   application, for the same requests.
+
+---
+
 ## Timeline and correlated examples
 
 ## Evidence that the originals were unmodified
