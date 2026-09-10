@@ -124,7 +124,7 @@ for i in $(seq 1 30); do curl -s http://127.0.0.1:8080/instance | grep -o 'app-0
 - Related commit: b7e754c
 - Remaining uncertainty: Resolved. Testing each line independently (parsing one line at a time rather than as a stream) identified the true malformed lines as access.log 311 and application.log 401 — two lines before jq's reported position, not one. Both are truncated mid-record: line 311 is 50 bytes against a normal 210 and ends at `"request_id":` with no value and no closing brace; line 401 is 45 bytes against a normal 203 and ends at `"event":`. The two-line offset is explained by parser behaviour: a truncated line leaves the parser expecting a value, the next line begins with `{` which is a legal value, so the parser consumes that entire good record as the value and only fails at the line after. Confirmed by supplying the missing brace: `{ sed -n '311,312p' logs/access.log; echo '}'; } | jq .` parses as one object with line 312's whole record nested inside the "request_id" field.
 
-## Entry 9 / 2026-09-09 / (your actual time)
+## Entry 9 / 2026-09-09 / 03:30 AM
 - Symptom: application.log contains 729 valid lines but only 680 distinct request_ids. 49 request_ids appear more than once, yet only 2 lines are byte-for-byte identical. So 47 request_ids have two records that differ from each other.
 - Hypothesis: I predicted the two records for each of those 47 requests would differ in timestamp, status and duration_ms — my reasoning being that if one client request produced two app records, it must have been handled twice, and a second handling would take a different amount of time and could end in a different status. logs/README.md states that comma-separated upstream values describe multiple attempts for one client request, which supported the idea that these were NGINX retries landing on the second backend.
 - Command or test:
@@ -140,7 +140,7 @@ for i in $(seq 1 30); do curl -s http://127.0.0.1:8080/instance | grep -o 'app-0
 - Related commit: c070684
 - Remaining uncertainty: I have shown that these 47 are not retries. I have NOT yet shown whether any genuine retries exist in the logs at all — that requires searching access.log for comma-separated upstream values, which is question 6 and not yet done. I also have not yet explained why access.log has 720 distinct request_ids against the apps' 680.
 
-## Entry 10 / 2026-09-09 / (your actual time)
+## Entry 10 / 2026-09-09 / 03:35 AM
 - Symptom: access.log contains 720 distinct request_ids but application.log contains only 680. Forty client requests were recorded by NGINX and by neither application instance.
 - Hypothesis: I predicted the apps never saw those forty requests because NGINX failed to connect to them, so no bytes ever reached an application process and there was nothing for it to log. My reasoning was that NGINX writes its access record regardless of what happens downstream, whereas an app can only log a request that actually arrived. I further predicted the client would have received a 5xx status, specifically 502.
 - Command or test:
