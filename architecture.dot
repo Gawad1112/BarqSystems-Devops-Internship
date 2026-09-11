@@ -1,0 +1,145 @@
+// architecture.dot — BARQ assessment environment
+//
+// Render with:  dot -Tpng architecture.dot -o architecture.png
+//
+// Committed as source so the diagram can be regenerated and reviewed as
+// text rather than only as an image.
+
+digraph barq {
+  // rankdir=TB lays the graph out top to bottom, following request flow.
+  rankdir=TB;
+  bgcolor="white";
+  compound=true;              // allows edges to point at cluster borders
+  nodesep=0.5;
+  ranksep=0.7;
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9];
+
+  // ---------------------------------------------------------------------
+  // Client, outside any Docker network
+  // ---------------------------------------------------------------------
+  client [label="Client\n(curl / browser)", fillcolor="#e8e8e8", shape=ellipse];
+
+  // ---------------------------------------------------------------------
+  // Host boundary
+  // ---------------------------------------------------------------------
+  subgraph cluster_host {
+    label="Docker host";
+    style="dashed";
+    color="#888888";
+    fontname="Helvetica";
+    fontsize=12;
+
+    hostport [label="127.0.0.1:8080\n(loopback only — not 0.0.0.0)",
+              shape=note, fillcolor="#fff3cd"];
+
+    // -------------------------------------------------------------------
+    // frontend network
+    // -------------------------------------------------------------------
+    subgraph cluster_frontend {
+      label="network: frontend";
+      style="rounded,filled";
+      fillcolor="#e3f2fd";
+      color="#1565c0";
+      fontname="Helvetica";
+      fontsize=12;
+
+      nginx [label="nginx\nnginx:1.28-alpine\nlisten 80\nno healthcheck",
+             fillcolor="#bbdefb"];
+    }
+
+    // -------------------------------------------------------------------
+    // Apps sit on BOTH networks — drawn between the two clusters
+    // -------------------------------------------------------------------
+    subgraph cluster_apps {
+      label="apps — on frontend AND backend";
+      style="rounded,filled";
+      fillcolor="#f1f8e9";
+      color="#558b2f";
+      fontname="Helvetica";
+      fontsize=12;
+
+      app01 [label="app-01\npython:3.12-slim\n:8080 (internal)\nuid 10001 (non-root)\nhealthcheck: GET /health",
+             fillcolor="#dcedc8"];
+      app02 [label="app-02\npython:3.12-slim\n:8080 (internal)\nuid 10001 (non-root)\nhealthcheck: GET /health",
+             fillcolor="#dcedc8"];
+    }
+
+    // -------------------------------------------------------------------
+    // backend network — internal: true, no route to the internet
+    // -------------------------------------------------------------------
+    subgraph cluster_backend {
+      label="network: backend  (internal: true)";
+      style="rounded,filled";
+      fillcolor="#fce4ec";
+      color="#ad1457";
+      fontname="Helvetica";
+      fontsize=12;
+
+      postgres [label="postgres\npostgres:16-alpine\n:5432 (internal)\nhealthcheck: pg_isready",
+                fillcolor="#f8bbd0"];
+      redis    [label="redis\nredis:7.4-alpine\n:6379 (internal)\nhealthcheck: redis-cli ping",
+                fillcolor="#f8bbd0"];
+    }
+
+    // -------------------------------------------------------------------
+    // Named volumes
+    // -------------------------------------------------------------------
+    subgraph cluster_storage {
+      label="named volumes";
+      style="rounded,filled";
+      fillcolor="#f5f5f5";
+      color="#616161";
+      fontname="Helvetica";
+      fontsize=12;
+
+      pgvol [label="postgres-data\n/var/lib/postgresql/data\n(the real PGDATA)",
+             shape=cylinder, fillcolor="#e0e0e0"];
+      rdvol [label="redis-data\n/data\nappendonly yes",
+             shape=cylinder, fillcolor="#e0e0e0"];
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Request flow
+  // ---------------------------------------------------------------------
+  client   -> hostport [label="  HTTP :8080"];
+  hostport -> nginx    [label="  published\n  8080 -> 80"];
+
+  nginx -> app01 [label="  upstream pool\n  round-robin\n  max_fails=3\n  fail_timeout=10s"];
+  nginx -> app02 [label="  proxy_next_upstream\n  error timeout\n  tries 2, budget 7s"];
+
+  app01 -> postgres [label="  DATABASE_URL\n  service name"];
+  app01 -> redis    [label="  REDIS_URL"];
+  app02 -> postgres [label="  service name,\n  not container IP"];
+  app02 -> redis    [label="  REDIS_URL"];
+
+  postgres -> pgvol [label="  persists", style=dashed, dir=none];
+  redis    -> rdvol [label="  persists", style=dashed, dir=none];
+
+  // ---------------------------------------------------------------------
+  // Blocked path — the isolation validate.py asserts
+  // ---------------------------------------------------------------------
+  nginx -> postgres [label="  BLOCKED\n  nginx is not on backend",
+                     style=dotted, color="#c62828", fontcolor="#c62828",
+                     constraint=false];
+
+  // ---------------------------------------------------------------------
+  // Health relationships, shown as a legend node
+  // ---------------------------------------------------------------------
+  health [shape=note, fillcolor="#fffde7", fontsize=10,
+          label="Health relationships\l\l\
+GET /health   liveness — process only, no dependency check\l\
+GET /ready    readiness — 200 only if postgres AND redis respond\l\
+GET /counter  real Redis INCR\l\
+GET /records  real PostgreSQL query\l\l\
+Container healthchecks:\l\
+  app-01, app-02  python urllib -> /health  (5s / 3 retries)\l\
+  postgres        pg_isready  — does NOT test storage (see finding 8)\l\
+  redis           redis-cli ping\l\
+  nginx           none configured\l"];
+
+  // Keep the legend off to the side rather than in the flow.
+  { rank=sink; health; }
+}
