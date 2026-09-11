@@ -1,0 +1,136 @@
+name: CI
+
+# Run on every push to main and on every pull request targeting main.
+# The task requires both: push proves the committed state works, pull_request
+# proves a change works BEFORE it is merged.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    # ubuntu-latest runners come with Docker and Docker Compose preinstalled,
+    # so no setup step is needed for either.
+    runs-on: ubuntu-latest
+
+    # A job with no timeout can hang for six hours on a stuck container.
+    # 15 minutes is generous for this stack and fails predictably if something
+    # never becomes ready.
+    timeout-minutes: 15
+
+    steps:
+      # --- checkout ------------------------------------------------------
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # --- environment ---------------------------------------------------
+      # .env is gitignored, so a fresh clone has no credentials and Compose
+      # would fail at parse time on the ${VAR:?} guards. Copying the tracked
+      # example file supplies consistent placeholder values.
+      #
+      # This doubles as a test of .env.example itself: if a variable the
+      # stack needs is missing from it, CI fails here and says which one.
+      # The database is created fresh and destroyed at the end of the run,
+      # so the placeholder password is never a real credential.
+      - name: Create .env from the tracked example
+        run: |
+          cp .env.example .env
+          echo "Variables supplied (values hidden):"
+          cut -d= -f1 .env | grep -v '^$'
+
+      # --- syntax checks -------------------------------------------------
+      # Cheap checks first. If the Compose file or the Python scripts are
+      # invalid there is no point spending minutes building images.
+      - name: Validate the Compose file
+        run: docker compose -p barq-assessment config > /dev/null
+
+      - name: Check Python syntax
+        # py_compile parses a file without executing it, so a syntax error is
+        # caught here rather than after the stack is already running.
+        run: |
+          python3 -m py_compile validate.py failure_test.py
+          echo "Python syntax OK"
+
+      - name: Check shell script syntax
+        # bash -n reads a script and reports syntax errors without running it.
+        # Running backup.sh here would be wrong — there is no database yet.
+        run: |
+          bash -n backup.sh
+          bash -n restore.sh
+          echo "Shell syntax OK"
+
+      # --- build and start -----------------------------------------------
+      - name: Build images
+        run: docker compose -p barq-assessment build
+
+      - name: Start the stack
+        run: docker compose -p barq-assessment up -d
+
+      # --- wait for readiness --------------------------------------------
+      # A bounded wait. Without it the validation would race the stack and
+      # fail intermittently, which is worse than failing consistently.
+      # The loop exits as soon as /ready returns 200, so a fast start is not
+      # penalised by a fixed sleep.
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:8080/ready > /dev/null 2>&1; then
+              echo "Ready after ${i} attempts"
+              curl -s http://127.0.0.1:8080/ready
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "FAIL: stack did not become ready within 120 seconds"
+          docker compose -p barq-assessment ps
+          docker compose -p barq-assessment logs --tail 50
+          exit 1
+
+      # --- validate ------------------------------------------------------
+      # validate.py exits non-zero on any failed check, and a non-zero exit
+      # from a step fails the whole job. This is what makes CI fail when
+      # validation fails, as the task requires.
+      - name: Run validation
+        run: python3 validate.py
+
+      - name: Run the failure test
+        run: python3 failure_test.py
+
+      # --- backup and restore --------------------------------------------
+      # Proves the scripts work against a real database, not just that they
+      # parse. Runs after validation so a failure here is unambiguous.
+      - name: Prove backup and restore
+        run: |
+          ./backup.sh
+          curl -s -X POST http://127.0.0.1:8080/records \
+            -H "Content-Type: application/json" \
+            -d '{"title":"ci-should-vanish"}'
+          echo
+          ./restore.sh
+          echo "Records after restore:"
+          curl -s http://127.0.0.1:8080/records
+          # The restored database must NOT contain the record created after
+          # the backup was taken. grep -q is silent; ! inverts the result,
+          # so this fails the step if the record is still present.
+          ! curl -s http://127.0.0.1:8080/records | grep -q "ci-should-vanish"
+          echo "Restore verified: the post-backup record is gone"
+
+      # --- diagnostics on failure ----------------------------------------
+      # if: failure() runs this step only when an earlier step failed.
+      # Without it, a failed CI run gives you a red cross and no explanation.
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "===== container status ====="
+          docker compose -p barq-assessment ps -a
+          echo "===== logs ====="
+          docker compose -p barq-assessment logs --no-color --tail 100
+
+      # --- cleanup -------------------------------------------------------
+      # if: always() runs regardless of outcome, so the runner is not left
+      # holding containers and volumes.
+      - name: Tear down
+        if: always()
+        run: docker compose -p barq-assessment down -v
