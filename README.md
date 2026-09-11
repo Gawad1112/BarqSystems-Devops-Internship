@@ -411,8 +411,10 @@ up and crawls. Availability and usability are not the same measurement.
 ## Q6. Which single points of failure remain? How would you fix them in production?
 
 **NGINX itself.** One instance, one container, no redundancy. If it stops,
-everything is unreachable regardless of how many app instances are running. It
-also has no healthcheck configured, so Docker has no signal about its state.
+everything is unreachable regardless of how many app instances are running. It now has a
+healthcheck requesting `/health` through the upstream pool, so Docker reports
+its state, but a healthcheck only reports a problem; it does not provide a
+second instance to fail over to.
 *Production:* multiple NGINX instances behind a load balancer or a managed
 ingress, in different availability zones.
 

@@ -45,7 +45,7 @@ digraph barq {
       fontname="Helvetica";
       fontsize=12;
 
-      nginx [label="nginx\nnginx:1.28-alpine\nlisten 80\nno healthcheck",
+      nginx [label="nginx\nnginx:1.28-alpine\nlisten 80\nhealthcheck: wget -> /health",
              fillcolor="#bbdefb"];
     }
 
@@ -138,7 +138,7 @@ Container healthchecks:\l\
   app-01, app-02  python urllib -> /health  (5s / 3 retries)\l\
   postgres        pg_isready  — does NOT test storage (see finding 8)\l\
   redis           redis-cli ping\l\
-  nginx           none configured\l"];
+  nginx           wget -> /health via upstream pool\l"];
 
   // Keep the legend off to the side rather than in the flow.
   { rank=sink; health; }
