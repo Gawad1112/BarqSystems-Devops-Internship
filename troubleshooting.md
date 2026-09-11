@@ -154,3 +154,40 @@ for i in $(seq 1 30); do curl -s http://127.0.0.1:8080/instance | grep -o 'app-0
 - Retest evidence: The three counts agree exactly and independently: 40 request_ids present in access.log and absent from application.log, 40 matching lines in error.log, 40 client responses of 502. The absence of application-side records is therefore not missing data but evidence of what occurred.
 - Related commit: ea1bcc9]
 - Remaining uncertainty: The logs show that the backend refused connections; they do not show why. A container that had stopped, an application process that had crashed, or a port binding failure would all produce identical evidence. Determining which would require container-level logs or orchestration events, which are not among the three supplied files. Noted for question 10.
+
+## Entry 11 / 2026-09-09 / 04:12 AM
+- Symptom: No live symptom yet — this was a known defect deferred from Part 2. `nginx/nginx.conf` had `max_fails=0` on both upstream servers and `proxy_next_upstream off` in the location block. Handover.md listed both as "deliberately not yet fixed, to be addressed when building the failure test".
+- Hypothesis: These settings would break the Part 3 failure requirement ("stop one backend, traffic continues"). With failure counting disabled NGINX would never bench a dead backend, and with retry disabled every request routed to it would return 502 to the client rather than being re-sent to the survivor. Predicted result after fixing both: zero client-visible 502s with one backend stopped, and a balanced split once it recovered.
+- Command or test: First established the cost of the existing settings from the historical logs (log_analysis.md Q6). During incident 1, 40 requests to `/`, `/counter`, `/health` and `/records` returned 502 to clients while app-01 was healthy and serving throughout. In the same window, 19 requests to `/ready` and `/instance` were retried — access.log shows them with comma-separated upstream values `502, 200` — and all 19 returned 200. Retry demonstrably worked where it was applied.
+
+  Then applied the fix and tested it live:
+  `docker compose -p barq-assessment exec nginx nginx -t`
+  `docker compose -p barq-assessment exec nginx nginx -s reload`
+  `docker compose -p barq-assessment exec nginx nginx -T 2>&1 | grep -E "max_fails|proxy_next_upstream|proxy_read_timeout"`
+  `docker compose -p barq-assessment stop app-02`
+  `for i in $(seq 1 30); do curl -s http://127.0.0.1:8080/instance | grep -o 'app-0[12]'; done | sort | uniq -c`
+  `for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/; done | sort | uniq -c`
+  `docker compose -p barq-assessment logs --tail 15 nginx`
+  `docker compose -p barq-assessment start app-02 && sleep 12`
+- Actual output: With app-02 stopped, all 30 `/instance` requests returned app-01 and all 30 `/` requests returned HTTP 200. Zero client-visible failures. After restarting app-02 and waiting 12 seconds, the split returned to 15 app-01 / 15 app-02.
+- Failed attempt and what changed your thinking: Two corrections, one before the test and one from its output.
+
+  First, I had misunderstood what `max_fails=3` does. I reasoned that NGINX would retry the same request against the same backend three times and only then try the other app. That is wrong. `max_fails` counts failures across *different* requests within the `fail_timeout` window; it never retries the same request on the same server. `proxy_next_upstream` is what acts within a single request. The two operate on different timescales — one saves the request in flight, the other stops future requests being sent to a server already proven bad. This compounded an earlier wrong turn recorded in my notes, where I first read `max_fails=0` as "stop after the first failure" when it means the opposite: failure counting is disabled entirely.
+
+  Second, the nginx log showed two different retry signatures, not one:
+    `"upstream_status":"502, 200"` with `request_time 1.069`
+    `"upstream_status":"504, 200"` with `request_time 2.005`, accompanied by an error.log line reading `upstream timed out (110: Operation timed out) while connecting to upstream`
+  I had expected every failed attempt against a stopped container to be an instant connection refusal, as in the historical logs where those failures returned in 0.003 s. A stopped container does not behave uniformly: some attempts were actively rejected and failed fast, while others had their packets dropped and NGINX waited out the full `proxy_connect_timeout 2s` before giving up. The 2.005 s figure is that timeout firing exactly.
+
+  This mattered more than it first appeared. Had I configured `proxy_next_upstream error` alone — which was my initial instinct, since a stopped backend seemed obviously a connection error — that 504 attempt would not have been retried and the client would have received a 504. Including `timeout` in the condition list was justified within minutes of applying it, by a case I had not anticipated when I made the decision.
+- Root cause: `max_fails=0` disabled passive health checking, so a failing backend was never removed from rotation. `proxy_next_upstream off` meant a request that failed on one backend was returned to the client as an error rather than re-sent to the other. Together they guaranteed that roughly half of all traffic would fail whenever either instance was down, despite a healthy instance being available.
+- Fix: In `nginx/nginx.conf`:
+  - `server app-01:8080 max_fails=3 fail_timeout=10s;` and the same for app-02
+  - `proxy_next_upstream error timeout;`
+  - `proxy_next_upstream_tries 2;`
+  - `proxy_next_upstream_timeout 7s;`
+  - `proxy_read_timeout` raised from 3s to 4s
+  `http_503` was deliberately excluded from the retry conditions — see decisions.md.
+- Retest evidence: `nginx -T` confirmed all six settings present in the running configuration, not merely saved to disk. With app-02 stopped: 30/30 requests served by app-01, 30/30 returned HTTP 200, zero 502s. The nginx access log showed the expected transition — the first few requests carrying comma-separated upstream values as they were retried onto app-01, followed by clean single-upstream entries at 0.002 s once `max_fails` had benched app-02. After restart and a 12-second wait (covering `fail_timeout=10s` plus the 5 s healthcheck interval), the split returned to 15/15, proving the recovered backend re-entered rotation.
+- Related commit: 27db67f
+- Remaining uncertainty: This was tested by stopping a container, which produces connection failures. I have not tested the case where a backend accepts connections but stops responding, which is what `proxy_read_timeout 4s` and the 7 s budget are actually sized for. That scenario is harder to produce deliberately and I have not yet found a clean way to simulate it. Separately, NGINX open source has no active health checking — it can only learn a backend is unhealthy by sending it a real client request that fails, so the first failure after an instance dies is always absorbed by a real request. `proxy_next_upstream` hides this from the client but the failure still occurs.
