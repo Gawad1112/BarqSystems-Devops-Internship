@@ -11,6 +11,7 @@ Standard library only — no pip install required, so CI runs it unchanged.
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -22,10 +23,48 @@ import urllib.request
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = "http://127.0.0.1:8080"
 PROJECT = "barq-assessment"
 
+
+def read_public_port(default=8080):
+    """
+    Read PUBLIC_PORT from .env, falling back to the Compose default.
+
+    The published port is configuration, not a constant, so the validator
+    reads the same source Compose does. This means the script follows the
+    stack when the public port changes, rather than needing to be edited —
+    a validator you have to modify to make it pass is not a validator.
+
+    os.environ takes precedence so the port can be overridden for a one-off
+    run without editing any file.
+    """
+    if "PUBLIC_PORT" in os.environ:
+        return int(os.environ["PUBLIC_PORT"])
+    try:
+        with open(".env") as f:
+            for line in f:
+                line = line.strip()
+                # Skip blank lines and comments.
+                if not line or line.startswith("#"):
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == "PUBLIC_PORT":
+                    return int(value.strip())
+    except FileNotFoundError:
+        pass
+    return default
+
+
+PUBLIC_PORT = read_public_port()
+BASE_URL = f"http://127.0.0.1:{PUBLIC_PORT}"
+
+# Ports that must NOT be reachable from the host. The datastores and the app
+# instances are never published. The alternate public port is included too:
+# whichever of 8080/8090 is not currently in use must be closed, which proves
+# a port change actually moved the listener rather than adding a second one.
 PROHIBITED_PORTS = [5432, 6379, 8081, 8082]
+ALTERNATE_PUBLIC_PORT = 8090 if PUBLIC_PORT == 8080 else 8080
+PROHIBITED_PORTS.append(ALTERNATE_PUBLIC_PORT)
 
 BALANCE_SAMPLE = 50
 
@@ -250,9 +289,9 @@ def port_open(host, port, timeout=2):
 
 
 def check_public_port():
-    ok = port_open("127.0.0.1", 8080)
-    report("NGINX is reachable on host port 8080", ok)
-
+    ok = port_open("127.0.0.1", PUBLIC_PORT)
+    report(f"NGINX is reachable on host port {PUBLIC_PORT}", ok,
+           "read from .env" if PUBLIC_PORT != 8080 else "")
 
 def check_prohibited_ports():
     """
@@ -315,7 +354,7 @@ def check_apps_can_reach_datastores():
 
 def main():
     print("=" * 60)
-    print("BARQ environment validation")
+    print(f"BARQ environment validation — public port {PUBLIC_PORT}")
     print("=" * 60)
 
     if not wait_for_ready():
